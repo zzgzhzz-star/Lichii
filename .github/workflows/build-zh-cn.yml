@@ -1,0 +1,273 @@
+name: Lichii 简体中文 Windows 构建
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 上游 build-N 标签，留空则构建 nx2 最新提交
+        type: string
+        default: ''
+  schedule:
+    - cron: '23 */3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lichii-zh-cn
+  cancel-in-progress: false
+
+jobs:
+  select-source:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      tag: ${{ steps.source.outputs.tag }}
+      needed: ${{ steps.source.outputs.needed }}
+    steps:
+      - name: 解析上游版本并跳过已发布提交
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          upstream=https://github.com/zortos293/Lichii.git
+          if [[ -z "$UPSTREAM_TAG" ]]; then
+            sha=$(git ls-remote --exit-code "$upstream" refs/heads/nx2 | cut -f1)
+          else
+            [[ "$UPSTREAM_TAG" =~ ^build-[0-9]+$ ]]
+            refs=$(git ls-remote --exit-code "$upstream" "refs/tags/$UPSTREAM_TAG" "refs/tags/$UPSTREAM_TAG^{}")
+            sha=$(cut -f1 <<< "$refs" | tail -n1)
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          tag="zh-cn-${sha:0:12}"
+          published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | .tag_name')
+          needed=true
+          if grep -Fxq -- "$tag" <<< "$published"; then
+            needed=false
+          fi
+          printf 'sha=%s\ntag=%s\nneeded=%s\n' "$sha" "$tag" "$needed" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: select-source
+    if: needs.select-source.outputs.needed == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: 获取选定的上游源码
+        uses: actions/checkout@v5
+        with:
+          repository: zortos293/Lichii
+          ref: ${{ needs.select-source.outputs.sha }}
+          persist-credentials: false
+
+      - name: 设置 MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: 安装 Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      - name: 安装 Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: 补齐简体中文词条
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          supplements = {
+              "MainWindow": {
+                  "Open &Lichii Folders": "打开 Lichii 文件夹(&L)",
+                  "&About Lichii": "关于 Lichii(&A)",
+                  "&Lichii Dependencies": "Lichii 依赖项(&L)",
+                  "Conversion in Progress": "正在转换",
+                  "This game cannot be started while its dump is being converted.": "游戏文件正在转换，暂时无法启动。",
+                  "Recommended Mario Kart World settings": "《马力欧卡丁车 世界》推荐设置",
+                  "Preparing game files...": "正在准备游戏文件…",
+                  "Unable to prepare game files": "无法准备游戏文件",
+                  "Game preparation failed. See the log for details.": "游戏文件准备失败，详情请查看日志。",
+                  "Hardware requirements not met": "未满足硬件要求",
+                  "Convert to NUP": "转换为 NUP",
+                  "The target archive already exists:\n%1": "目标归档已存在：\n%1",
+                  "Resume Conversion": "继续转换",
+                  "Resume the interrupted conversion?": "是否继续上次中断的转换？",
+                  "Converting to NUP": "正在转换为 NUP",
+                  "Conversion Complete": "转换完成",
+                  "The NUP was created and the loose folder was removed.": "已创建 NUP 并移除原文件夹。",
+                  "The NUP was created. You can delete the loose folder if you no longer need it.": "已创建 NUP。如不再需要原文件夹，可以删除它。",
+                  "Conversion Cancelled": "转换已取消",
+                  "The conversion can be resumed by choosing Convert to NUP again.": "再次选择“转换为 NUP”可继续转换。",
+                  "Conversion Failed": "转换失败",
+                  "Extract NUP": "解包 NUP",
+                  "The target directory already exists:\n%1": "目标目录已存在：\n%1",
+                  "Extracting NUP": "正在解包 NUP",
+                  "Extraction Complete": "解包完成",
+                  "The NUP was extracted. You can delete the NUP file if you no longer need it.": "NUP 已解包。如不再需要原 NUP 文件，可以删除它。",
+                  "Extraction Failed": "解包失败",
+                  "Editing NUP Metadata": "正在编辑 NUP 元数据",
+                  "Edit Complete": "编辑完成",
+                  "The NUP metadata was updated.": "NUP 元数据已更新。",
+                  "Edit Failed": "编辑失败",
+                  "Restart Lichii to apply the X11 backend.": "重启 Lichii 以启用 X11 后端。",
+                  "Are you sure you want to close Lichii?": "确定要关闭 Lichii 吗？",
+                  "The currently running application has requested Lichii to not exit.\n\nWould you like to bypass this and exit anyway?": "当前运行的应用请求 Lichii 保持运行。\n\n是否忽略该请求并退出？",
+              },
+              "ConfigureDialog": {"Lichii Configuration": "Lichii 设置"},
+              "ConfigureDebug": {
+                  "**This will be reset automatically when Lichii closes.": "**关闭 Lichii 时，此项将自动重置。",
+              },
+              "ConfigureInputAdvanced": {"Requires restarting Lichii": "需要重启 Lichii"},
+              "ConfigureWeb": {"Lichii Web Service": "Lichii 网络服务"},
+              "AboutDialog": {"About Lichii": "关于 Lichii"},
+              "ConfigurePerGame": {
+                  "Preview a local icon next to the archive. Online lookup is optional. Apply or OK saves changes.": "预览归档文件旁的本地图标，可选用在线查找。点击“应用”或“确定”保存更改。",
+                  "Detect Icon": "查找图标",
+                  "Preview a local image as the game icon. Apply or OK saves changes.": "预览本地图片作为游戏图标。点击“应用”或“确定”保存更改。",
+                  "Upload Icon...": "选择图标…",
+                  "Allow online lookup": "允许在线查找",
+                  "If no local icon is found, send the game name to GitHub, Wikipedia and Bing to look for an icon. Disabled by default.": "如果找不到本地图标，将游戏名称发送到 GitHub、维基百科和必应以查找图标。此选项默认关闭。",
+                  "Enter game name...": "输入游戏名称…",
+                  "Edit the game name stored in the NUP metadata": "编辑 NUP 元数据中保存的游戏名称",
+                  "Select Game Icon": "选择游戏图标",
+                  "Images (*.png *.jpg *.jpeg *.bmp *.webp);;All Files (*)": "图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*)",
+                  "Invalid Image": "无效图片",
+                  "Select a PNG, JPEG, BMP or WebP image up to 8 MiB, 8192 pixels per side and 16 megapixels.": "请选择 PNG、JPEG、BMP 或 WebP 图片，大小不超过 8 MiB，单边不超过 8192 像素，总像素不超过 1600 万。",
+                  "Please enter a game name first so the icon can be detected.": "请输入游戏名称，以便查找图标。",
+                  "The game name is too long to search.": "游戏名称太长，无法搜索。",
+                  "Detecting...": "正在查找…",
+                  "Update NUP Metadata": "更新 NUP 元数据",
+                  "Stop emulation before changing NUP metadata.": "请先停止模拟，再修改 NUP 元数据。",
+                  "Failed to update NUP metadata:\n%1": "无法更新 NUP 元数据：\n%1",
+              },
+          }
+
+          path = Path("dist/languages/zh_CN.ts")
+          tree = ET.parse(path)
+          root = tree.getroot()
+          contexts = {context.findtext("name"): context for context in root.findall("context")}
+          for name, entries in supplements.items():
+              context = contexts.get(name)
+              if context is None:
+                  context = ET.SubElement(root, "context")
+                  ET.SubElement(context, "name").text = name
+
+              messages = {
+                  message.findtext("source"): message
+                  for message in context.findall("message")
+                  if not message.findtext("comment") and message.get("numerus") != "yes"
+              }
+              for source, text in entries.items():
+                  message = messages.get(source)
+                  if message is None:
+                      message = ET.SubElement(context, "message")
+                      ET.SubElement(message, "source").text = source
+                  translation = message.find("translation")
+                  if translation is None:
+                      translation = ET.SubElement(message, "translation")
+                  elif translation.get("type") is None and (translation.text or "").strip():
+                      continue
+                  translation.attrib.pop("type", None)
+                  translation.text = text
+
+          ET.indent(tree)
+          path.write_text('<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE TS>\n'
+                          + ET.tostring(root, encoding="unicode") + "\n", encoding="utf-8")
+          PY
+
+      - name: 配置 Release 构建
+        shell: bash
+        run: >-
+          cmake -S . -B build/release -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=OFF
+          -DYUZU_TESTS=OFF
+          -DYUZU_CMD=OFF
+          -DYUZU_ROOM=OFF
+          -DYUZU_ROOM_STANDALONE=OFF
+          -DYUZU_USE_BUNDLED_QT=OFF
+          -DYUZU_USE_BUNDLED_SDL3=ON
+          -DENABLE_QT_TRANSLATION=ON
+          -DENABLE_UPDATE_CHECKER=OFF
+          -DUSE_DISCORD_PRESENCE=OFF
+
+      - name: 编译 Lichii
+        run: cmake --build build/release --target yuzu --parallel
+
+      - name: 验证并打包
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.select-source.outputs.tag }}
+        run: |
+          $bin = 'build/release/bin'
+          $exe = Join-Path $bin 'lichii.exe'
+          if (-not (Test-Path $exe)) { throw 'lichii.exe is missing' }
+          if (-not (Test-Path 'build/release/src/yuzu/zh_CN.qm')) { throw 'zh_CN.qm is missing' }
+          windeployqt --release --no-translations $exe
+          if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed' }
+          Copy-Item -LiteralPath 'LICENSE.txt' -Destination $bin
+          Copy-Item -LiteralPath 'LICENSES' -Destination $bin -Recurse -Force
+          @(
+            '打开 lichii.exe，选择 Emulation > Configure > General > UI。'
+            '在 Interface language 中选择 Chinese (China)。'
+          ) | Set-Content -Encoding utf8 (Join-Path $bin '简体中文说明.txt')
+          $zip = "Lichii-$env:RELEASE_TAG-windows-x64.zip"
+          Compress-Archive -Path "$bin/*" -DestinationPath $zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          "$hash  $zip`n" | Set-Content -Encoding ascii -NoNewline SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lichii-zh-cn
+          path: |
+            Lichii-*-windows-x64.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+  publish:
+    needs: [select-source, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: lichii-zh-cn
+
+      - name: 发布中文 Windows ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.select-source.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.select-source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          zip="Lichii-$RELEASE_TAG-windows-x64.zip"
+          sha256sum --check SHA256SUMS.txt
+          cat > notes.md <<EOF
+          Lichii Windows x64 简体中文构建。解压 ZIP，打开 lichii.exe。
+          在 Emulation → Configure → General → UI → Interface language 选择 Chinese (China)。
+
+          - 上游源码：https://github.com/zortos293/Lichii/tree/$UPSTREAM_SHA
+          - 中文词条及构建配置：https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/.github/workflows/build-zh-cn.yml
+          EOF
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' > draft.txt 2>/dev/null; then
+            if grep -Fxq true draft.txt; then
+              gh release upload "$RELEASE_TAG" "$zip" SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
+              gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+            fi
+          else
+            gh release create "$RELEASE_TAG" "$zip" SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "Lichii 简体中文 Windows x64 · ${UPSTREAM_SHA:0:12}" \
+              --notes-file notes.md
+          fi
