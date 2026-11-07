@@ -70,11 +70,19 @@ jobs:
               const sha = commits.get(release.tag_name);
               if (sha) titles.set(sha, release.name || release.tag_name);
             }
-            function titleFor(sha) {
-              const original = titles.get(sha) || 'Lichii nx2 (' + sha.slice(0, 7) + ')';
-              return original + ' Win[ZH]';
+            function titleFor(sha, builtAt) {
+              if (titles.has(sha)) return titles.get(sha) + ' Win[ZH]';
+              const parts = new Intl.DateTimeFormat('en-GB', {
+                timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit',
+                day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+              }).formatToParts(new Date(builtAt));
+              const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+              const stamp = values.year + '-' + values.month + '-' + values.day
+                + '-' + values.hour + '：' + values.minute;
+              return 'Lichii nx2 (构建时间 ' + stamp + ') Win[ZH]';
             }
-            core.setOutput('title', titleFor(process.env.UPSTREAM_SHA));
+            const upstreamTitle = titles.get(process.env.UPSTREAM_SHA);
+            core.setOutput('title', upstreamTitle ? upstreamTitle + ' Win[ZH]' : '');
             const chinese = await github.paginate(github.rest.repos.listReleases, {
               ...context.repo, per_page: 100
             });
@@ -85,7 +93,9 @@ jobs:
               const sha = [...titles.keys()].find(value => value.startsWith(match[1]))
                 || (source && source[1].startsWith(match[1]) ? source[1] : null);
               if (!sha) continue;
-              const name = titleFor(sha);
+              const zip = release.assets.find(asset => asset.name.endsWith('.zip'));
+              const builtAt = zip?.created_at || release.published_at || release.created_at;
+              const name = titleFor(sha, builtAt);
               if (release.name !== name) {
                 await github.rest.repos.updateRelease({
                   ...context.repo, release_id: release.id, name
@@ -298,6 +308,10 @@ jobs:
         run: |
           set -euo pipefail
           zip="Lichii-$RELEASE_TAG-windows-x64.zip"
+          if [[ -z "$RELEASE_TITLE" ]]; then
+            stamp=$(TZ=Asia/Shanghai date '+%Y-%m-%d-%H：%M')
+            RELEASE_TITLE="Lichii nx2 (构建时间 $stamp) Win[ZH]"
+          fi
           sha256sum --check SHA256SUMS.txt
           cat > notes.md <<EOF
           Lichii Windows x64 简体中文构建。解压 ZIP，打开 lichii.exe。
