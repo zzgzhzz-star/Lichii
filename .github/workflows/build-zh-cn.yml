@@ -19,11 +19,14 @@ concurrency:
 
 jobs:
   select-source:
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.source.outputs.sha }}
       tag: ${{ steps.source.outputs.tag }}
       needed: ${{ steps.source.outputs.needed }}
+      title: ${{ steps.names.outputs.title }}
     steps:
       - name: 解析上游版本并跳过已发布提交
         id: source
@@ -49,6 +52,45 @@ jobs:
             needed=false
           fi
           printf 'sha=%s\ntag=%s\nneeded=%s\n' "$sha" "$tag" "$needed" >> "$GITHUB_OUTPUT"
+
+      - name: 使用上游 Release 标题并更新已有中文版名称
+        id: names
+        uses: actions/github-script@v8
+        env:
+          UPSTREAM_SHA: ${{ steps.source.outputs.sha }}
+        with:
+          script: |
+            const upstream = { owner: 'zortos293', repo: 'Lichii', per_page: 100 };
+            const releases = await github.paginate(github.rest.repos.listReleases, upstream);
+            const tags = await github.paginate(github.rest.repos.listTags, upstream);
+            const commits = new Map(tags.map(tag => [tag.name, tag.commit.sha]));
+            const titles = new Map();
+            for (const release of releases) {
+              if (release.draft) continue;
+              const sha = commits.get(release.tag_name);
+              if (sha) titles.set(sha, release.name || release.tag_name);
+            }
+            function titleFor(sha) {
+              const original = titles.get(sha) || 'Lichii nx2 (' + sha.slice(0, 7) + ')';
+              return original + ' Win[ZH]';
+            }
+            core.setOutput('title', titleFor(process.env.UPSTREAM_SHA));
+            const chinese = await github.paginate(github.rest.repos.listReleases, {
+              ...context.repo, per_page: 100
+            });
+            for (const release of chinese) {
+              const match = /^zh-cn-([0-9a-f]{12})$/.exec(release.tag_name);
+              if (!match || release.draft) continue;
+              const sha = [...titles.keys()].find(value => value.startsWith(match[1]));
+              if (!sha) continue;
+              const name = titleFor(sha);
+              if (release.name !== name) {
+                await github.rest.repos.updateRelease({
+                  ...context.repo, release_id: release.id, name
+                });
+                core.info('Updated ' + release.tag_name + ' to ' + name);
+              }
+            }
 
   windows:
     needs: select-source
@@ -250,6 +292,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.select-source.outputs.tag }}
           UPSTREAM_SHA: ${{ needs.select-source.outputs.sha }}
+          RELEASE_TITLE: ${{ needs.select-source.outputs.title }}
         run: |
           set -euo pipefail
           zip="Lichii-$RELEASE_TAG-windows-x64.zip"
@@ -264,10 +307,10 @@ jobs:
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' > draft.txt 2>/dev/null; then
             if grep -Fxq true draft.txt; then
               gh release upload "$RELEASE_TAG" "$zip" SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
-              gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+              gh release edit "$RELEASE_TAG" --draft=false --title "$RELEASE_TITLE" --repo "$GITHUB_REPOSITORY"
             fi
           else
             gh release create "$RELEASE_TAG" "$zip" SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" --title "Lichii 简体中文 Windows x64 · ${UPSTREAM_SHA:0:12}" \
+              --target "$GITHUB_SHA" --title "$RELEASE_TITLE" \
               --notes-file notes.md
           fi
