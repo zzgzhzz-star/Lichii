@@ -44,7 +44,7 @@ jobs:
             sha=$(cut -f1 <<< "$refs" | tail -n1)
           fi
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
-          tag="zh-cn-${sha:0:12}"
+          tag="zh-cn-${sha:0:12}-u1"
           published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --jq '.[] | select(.draft == false) | .tag_name')
           needed=true
@@ -87,7 +87,7 @@ jobs:
               ...context.repo, per_page: 100
             });
             for (const release of chinese) {
-              const match = /^zh-cn-([0-9a-f]{12})$/.exec(release.tag_name);
+              const match = /^zh-cn-([0-9a-f]{12})(?:-u1)?$/.exec(release.tag_name);
               if (!match || release.draft) continue;
               const source = /github\.com\/zortos293\/Lichii\/tree\/([0-9a-f]{40})/.exec(release.body || '');
               const sha = [...titles.keys()].find(value => value.startsWith(match[1]))
@@ -240,21 +240,159 @@ jobs:
                           + ET.tostring(root, encoding="unicode") + "\n", encoding="utf-8")
           PY
 
+      - name: 接入中文版程序内更新
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          
+          def replace_once(path, before, after):
+              text = path.read_text(encoding="utf-8")
+              if text.count(before) != 1:
+                  raise RuntimeError(f"Updater patch no longer matches upstream: {path}")
+              path.write_text(text.replace(before, after), encoding="utf-8")
+          
+          scm = Path("CMakeModules/GenerateSCMRev.cmake")
+          replace_once(scm, 'set(BUILD_AUTO_UPDATE_STABLE_REPO "zortos293/Lichii")',
+                       'set(BUILD_AUTO_UPDATE_STABLE_REPO "zzgzhzz-star/Lichii")')
+          replace_once(scm, 'set(BUILD_AUTO_UPDATE_API_PATH "/repos/zortos293/Lichii/releases?per_page=100")',
+                       'set(BUILD_AUTO_UPDATE_API_PATH "/repos/zzgzhzz-star/Lichii/releases?per_page=100")')
+          replace_once(scm, 'set(BUILD_AUTO_UPDATE_REPO "zortos293/Lichii")',
+                       'set(BUILD_AUTO_UPDATE_REPO "zzgzhzz-star/Lichii")')
+          replace_once(scm, 'if (LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")',
+                       'if (LICHII_BUILD_TAG MATCHES "^build-[0-9]+$" OR LICHII_BUILD_TAG MATCHES "^zh-cn-[0-9a-f]+-u1$")')
+          
+          net = Path("src/common/net/net.cpp")
+          replace_once(net,
+              '        const auto filename = fmt::format("lichii-{}{}", platform, extension);',
+              '''        const auto filename = platform == "windows-x86_64" && tag.starts_with("zh-cn-")
+                                            ? fmt::format("Lichii-{}-windows-x64.zip", tag)
+                                            : fmt::format("lichii-{}{}", platform, extension);''')
+          
+          checker = Path("src/frontend_common/update_checker.cpp")
+          replace_once(checker, "#include <charconv>", "#include <algorithm>\n#include <charconv>")
+          replace_once(checker,
+              "    auto newest = ParseBuildNumber(build_tag);",
+              '''    if (build_tag.starts_with("zh-cn-")) {
+                  const auto current = std::find_if(releases.begin(), releases.end(),
+                                                   [build_tag](const auto& release) {
+                                                       return release.tag == build_tag;
+                                                   });
+                  if (current == releases.end()) {
+                      return std::nullopt;
+                  }
+                  const Common::Net::Release* selected = &*current;
+                  for (const auto& release : releases) {
+                      if (release.tag.starts_with("zh-cn-") &&
+                          release.published > selected->published &&
+                          !release.GetPlatformAssets(platform).empty()) {
+                          selected = &release;
+                      }
+                  }
+                  return selected == &*current ? std::nullopt : std::make_optional(*selected);
+              }
+          
+              auto newest = ParseBuildNumber(build_tag);''')
+          replace_once(checker,
+              '''    if (!ParseBuildNumber(Common::g_build_release_tag) ||
+                  std::string_view{Common::g_build_release_platform}.empty()) {''',
+              '''    const std::string_view build_tag{Common::g_build_release_tag};
+              if ((!build_tag.starts_with("zh-cn-") && !ParseBuildNumber(build_tag)) ||
+                  std::string_view{Common::g_build_release_platform}.empty()) {''')
+          replace_once(checker,
+              '''    auto update = SelectUpdate(Common::Net::GetReleases(), Common::g_build_release_tag,
+                                         Common::g_build_release_platform);''',
+              '''    auto releases = Common::Net::GetReleases();
+              if (build_tag.starts_with("zh-cn-") &&
+                  std::none_of(releases.begin(), releases.end(), [build_tag](const auto& release) {
+                      return release.tag == build_tag;
+                  })) {
+                  const auto path = std::string{"/repos/"} + Common::g_build_auto_update_repo +
+                                    "/releases/tags/" + std::string{build_tag};
+                  const auto body = Common::Net::MakeRequest(
+                      std::string{"https://"} + Common::g_build_auto_update_stable_api, path);
+                  if (body) {
+                      const auto current = Common::Net::Release::FromJson(
+                          std::string_view{*body}, Common::g_build_auto_update_stable_api,
+                          Common::g_build_auto_update_repo);
+                      if (current) {
+                          releases.push_back(*current);
+                      }
+                  }
+              }
+              auto update = SelectUpdate(releases, build_tag, Common::g_build_release_platform);''')
+          
+          tests = Path("src/tests/common/update_checker.cpp")
+          text = tests.read_text(encoding="utf-8").replace("zortos293/Lichii", "zzgzhzz-star/Lichii")
+          text += r'''
+          TEST_CASE("Chinese updates use release publication order and matching ZIP files", "[updater][zh-cn-updater]") {
+              auto current = MakeRelease("zh-cn-aaaaaaaaaaaa-u1",
+                                         "Lichii-zh-cn-aaaaaaaaaaaa-u1-windows-x64.zip");
+              current.published = 100;
+              auto newer = MakeRelease("zh-cn-bbbbbbbbbbbb-u1",
+                                       "Lichii-zh-cn-bbbbbbbbbbbb-u1-windows-x64.zip");
+              newer.published = 200;
+              auto older = MakeRelease("zh-cn-cccccccccccc",
+                                       "Lichii-zh-cn-cccccccccccc-windows-x64.zip");
+              older.published = 50;
+              auto wrong_platform = MakeRelease("zh-cn-dddddddddddd-u1", "lichii-linux-x86_64.tar.gz");
+              wrong_platform.published = 300;
+              auto foreign = MakeRelease("zh-cn-eeeeeeeeeeee-u1",
+                                         "Lichii-zh-cn-eeeeeeeeeeee-u1-windows-x64.zip");
+              foreign.published = 400;
+              foreign.assets = {"https://github.com/zortos293/Lichii/releases/download/" +
+                                foreign.tag + "/Lichii-" + foreign.tag + "-windows-x64.zip"};
+              const auto releases = std::array{wrong_platform, older, foreign, newer, current};
+              const auto update = UpdateChecker::SelectUpdate(releases, current.tag, "windows-x86_64");
+              REQUIRE(update);
+              CHECK(update->tag == newer.tag);
+              const auto assets = update->GetPlatformAssets("windows-x86_64");
+              REQUIRE(assets.size() == 1);
+              CHECK(assets[0].filename == "Lichii-zh-cn-bbbbbbbbbbbb-u1-windows-x64.zip");
+              CHECK(assets[0].path == "/zzgzhzz-star/Lichii/releases/download/" + newer.tag +
+                                     "/" + assets[0].filename);
+              CHECK_FALSE(UpdateChecker::SelectUpdate(releases, newer.tag, "windows-x86_64"));
+              CHECK_FALSE(UpdateChecker::SelectUpdate(releases, current.tag, "linux-x86_64"));
+              CHECK_FALSE(UpdateChecker::SelectUpdate(releases, "zh-cn-missing-u1", "windows-x86_64"));
+              CHECK_FALSE(UpdateChecker::SelectUpdate({}, current.tag, "windows-x86_64"));
+              auto renamed = releases;
+              renamed[3].title = "Lichii nx2 build 93 (bbbbbbb) Win[ZH]";
+              CHECK(UpdateChecker::SelectUpdate(renamed, current.tag, "windows-x86_64")->tag == newer.tag);
+              auto same_time = std::array{current, newer};
+              same_time[1].published = current.published;
+              CHECK_FALSE(UpdateChecker::SelectUpdate(same_time, current.tag, "windows-x86_64"));
+          }
+          '''
+          tests.write_text(text, encoding="utf-8")
+          PY
+
       - name: 配置 Release 构建
         shell: bash
         run: >-
           cmake -S . -B build/release -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DBUILD_TESTING=OFF
-          -DYUZU_TESTS=OFF
+          -DBUILD_TESTING=ON
+          -DYUZU_TESTS=ON
           -DYUZU_CMD=OFF
           -DYUZU_ROOM=OFF
           -DYUZU_ROOM_STANDALONE=OFF
           -DYUZU_USE_BUNDLED_QT=OFF
           -DYUZU_USE_BUNDLED_SDL3=ON
           -DENABLE_QT_TRANSLATION=ON
-          -DENABLE_UPDATE_CHECKER=OFF
+          -DENABLE_UPDATE_CHECKER=ON
+          -DLICHII_BUILD_TAG=${{ needs.select-source.outputs.tag }}
+          -DLICHII_BUILD_PLATFORM=windows-x86_64
           -DUSE_DISCORD_PRESENCE=OFF
+
+      - name: 编译并测试更新器
+        run: cmake --build build/release --target update_checker_tests --parallel
+
+      - name: 运行更新器回归测试
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:QT_ROOT_DIR/bin;$env:PATH"
+          & build/release/bin/update_checker_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Updater tests failed' }
 
       - name: 编译 Lichii
         run: cmake --build build/release --target yuzu --parallel
@@ -268,6 +406,9 @@ jobs:
           $exe = Join-Path $bin 'lichii.exe'
           if (-not (Test-Path $exe)) { throw 'lichii.exe is missing' }
           if (-not (Test-Path 'build/release/src/yuzu/zh_CN.qm')) { throw 'zh_CN.qm is missing' }
+          Remove-Item -LiteralPath (Join-Path $bin 'update_checker_tests.exe')
+          $testSymbols = Join-Path $bin 'update_checker_tests.pdb'
+          if (Test-Path $testSymbols) { Remove-Item -LiteralPath $testSymbols }
           windeployqt --release --no-translations $exe
           if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed' }
           Copy-Item -LiteralPath 'LICENSE.txt' -Destination $bin
