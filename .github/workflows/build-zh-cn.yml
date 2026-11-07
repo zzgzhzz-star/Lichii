@@ -81,7 +81,9 @@ jobs:
             for (const release of chinese) {
               const match = /^zh-cn-([0-9a-f]{12})$/.exec(release.tag_name);
               if (!match || release.draft) continue;
-              const sha = [...titles.keys()].find(value => value.startsWith(match[1]));
+              const source = /github\.com\/zortos293\/Lichii\/tree\/([0-9a-f]{40})/.exec(release.body || '');
+              const sha = [...titles.keys()].find(value => value.startsWith(match[1]))
+                || (source && source[1].startsWith(match[1]) ? source[1] : null);
               if (!sha) continue;
               const name = titleFor(sha);
               if (release.name !== name) {
