@@ -352,7 +352,7 @@ jobs:
               CHECK(assets[0].path == "/zzgzhzz-star/Lichii/releases/download/" + newer.tag +
                                      "/" + assets[0].filename);
               CHECK_FALSE(UpdateChecker::SelectUpdate(releases, newer.tag, "windows-x86_64"));
-              CHECK_FALSE(UpdateChecker::SelectUpdate(releases, current.tag, "linux-x86_64"));
+              CHECK_FALSE(UpdateChecker::SelectUpdate(releases, current.tag, "windows-x86_64-pgo"));
               CHECK_FALSE(UpdateChecker::SelectUpdate(releases, "zh-cn-missing-u1", "windows-x86_64"));
               CHECK_FALSE(UpdateChecker::SelectUpdate({}, current.tag, "windows-x86_64"));
               auto renamed = releases;
