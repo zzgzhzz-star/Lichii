@@ -278,13 +278,22 @@ jobs:
                        'if (LICHII_BUILD_TAG MATCHES "^build-[0-9]+$" OR LICHII_BUILD_TAG MATCHES "^zh-cn-[0-9a-f]+-u1$")')
           
           net = Path("src/common/net/net.cpp")
-          replace_once(net,
+          modern_net = 'platform.remove_suffix(4)' in net.read_text(encoding="utf-8")
+          if modern_net:
+              replace_once(net,
+                  '            const auto filename = fmt::format("lichii-{}{}{}", platform, variant, extension);',
+                  '''            const auto filename = platform == "windows-x86_64" && variant.empty() && tag.starts_with("zh-cn-")
+                                                ? fmt::format("Lichii-{}-windows-x64.zip", tag)
+                                                : fmt::format("lichii-{}{}{}", platform, variant, extension);''')
+          else:
+              replace_once(net,
               '        const auto filename = fmt::format("lichii-{}{}", platform, extension);',
               '''        const auto filename = platform == "windows-x86_64" && tag.starts_with("zh-cn-")
                                             ? fmt::format("Lichii-{}-windows-x64.zip", tag)
                                             : fmt::format("lichii-{}{}", platform, extension);''')
           
           checker = Path("src/frontend_common/update_checker.cpp")
+          modern_checker = 'CheckResult Check()' in checker.read_text(encoding="utf-8")
           replace_once(checker, "#include <charconv>", "#include <algorithm>\n#include <charconv>")
           replace_once(checker,
               "    auto newest = ParseBuildNumber(build_tag);",
@@ -314,10 +323,13 @@ jobs:
               '''    const std::string_view build_tag{Common::g_build_release_tag};
               if ((!build_tag.starts_with("zh-cn-") && !ParseBuildNumber(build_tag)) ||
                   std::string_view{Common::g_build_release_platform}.empty()) {''')
-          replace_once(checker,
-              '''    auto update = SelectUpdate(Common::Net::GetReleases(), Common::g_build_release_tag,
-                                         Common::g_build_release_platform);''',
-              '''    auto releases = Common::Net::GetReleases();
+          before_select = '''    auto update = SelectUpdate(Common::Net::GetReleases(), Common::g_build_release_tag,
+                                         Common::g_build_release_platform);'''
+          if modern_checker:
+              before_select = '''    auto update = SelectUpdate(list.releases, Common::g_build_release_tag,
+                                         Common::g_build_release_platform,
+                                         Common::Net::CurrentLinuxPackage());'''
+          after_select = '''    auto releases = Common::Net::GetReleases();
               if (build_tag.starts_with("zh-cn-") &&
                   std::none_of(releases.begin(), releases.end(), [build_tag](const auto& release) {
                       return release.tag == build_tag;
@@ -335,7 +347,11 @@ jobs:
                       }
                   }
               }
-              auto update = SelectUpdate(releases, build_tag, Common::g_build_release_platform);''')
+              auto update = SelectUpdate(releases, build_tag, Common::g_build_release_platform);'''
+          if modern_checker:
+              after_select = after_select.replace('auto releases = Common::Net::GetReleases();',
+                                                  'auto releases = list.releases;')
+          replace_once(checker, before_select, after_select)
           
           tests = Path("src/tests/common/update_checker.cpp")
           text = tests.read_text(encoding="utf-8").replace("zortos293/Lichii", "zzgzhzz-star/Lichii")
@@ -367,7 +383,7 @@ jobs:
               CHECK(assets[0].path == "/zzgzhzz-star/Lichii/releases/download/" + newer.tag +
                                      "/" + assets[0].filename);
               CHECK_FALSE(UpdateChecker::SelectUpdate(releases, newer.tag, "windows-x86_64"));
-              CHECK_FALSE(UpdateChecker::SelectUpdate(releases, current.tag, "windows-x86_64-pgo"));
+              CHECK_FALSE(UpdateChecker::SelectUpdate(releases, current.tag, "android-arm64"));
               CHECK_FALSE(UpdateChecker::SelectUpdate(releases, "zh-cn-missing-u1", "windows-x86_64"));
               CHECK_FALSE(UpdateChecker::SelectUpdate({}, current.tag, "windows-x86_64"));
               auto renamed = releases;
