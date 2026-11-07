@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: 上游 build-N 标签，留空则构建 nx2 最新提交
+        description: 上游 build-N 标签，留空时优先构建新 Release，否则检查 nx2 最新提交
         type: string
         default: ''
   schedule:
-    - cron: '23 */6 * * *'
+    - cron: '23 */12 * * *'
 
 permissions:
   contents: read
@@ -36,21 +36,36 @@ jobs:
         run: |
           set -euo pipefail
           upstream=https://github.com/zortos293/Lichii.git
+          published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | .tag_name')
+          if [[ -n "$UPSTREAM_TAG" ]]; then
+            [[ "$UPSTREAM_TAG" =~ ^build-[0-9]+$ ]]
+          else
+            latest_tag=$(gh api --paginate --slurp 'repos/zortos293/Lichii/releases?per_page=100' \
+              --jq '[.[][] | select(.draft == false and (.tag_name | test("^build-[0-9]+$")))] | max_by(.published_at) | .tag_name // empty')
+            if [[ -n "$latest_tag" ]]; then
+              refs=$(git ls-remote --exit-code "$upstream" "refs/tags/$latest_tag" "refs/tags/$latest_tag^{}")
+              release_sha=$(cut -f1 <<< "$refs" | tail -n1)
+              [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]]
+              release_tag="zh-cn-${release_sha:0:12}-u1"
+              if ! grep -Fxq -- "$release_tag" <<< "$published"; then
+                UPSTREAM_TAG="$latest_tag"
+              fi
+            fi
+          fi
           if [[ -z "$UPSTREAM_TAG" ]]; then
             sha=$(git ls-remote --exit-code "$upstream" refs/heads/nx2 | cut -f1)
           else
-            [[ "$UPSTREAM_TAG" =~ ^build-[0-9]+$ ]]
             refs=$(git ls-remote --exit-code "$upstream" "refs/tags/$UPSTREAM_TAG" "refs/tags/$UPSTREAM_TAG^{}")
             sha=$(cut -f1 <<< "$refs" | tail -n1)
           fi
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           tag="zh-cn-${sha:0:12}-u1"
-          published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select(.draft == false) | .tag_name')
           needed=true
           if grep -Fxq -- "$tag" <<< "$published"; then
             needed=false
           fi
+          echo "Selected upstream: ${UPSTREAM_TAG:-nx2} ($sha), build required: $needed"
           printf 'sha=%s\ntag=%s\nneeded=%s\n' "$sha" "$tag" "$needed" >> "$GITHUB_OUTPUT"
 
       - name: 使用上游 Release 标题并更新已有中文版名称
@@ -65,10 +80,10 @@ jobs:
             const tags = await github.paginate(github.rest.repos.listTags, upstream);
             const commits = new Map(tags.map(tag => [tag.name, tag.commit.sha]));
             const titles = new Map();
-            for (const release of releases) {
+            for (const release of [...releases].sort((a, b) => Date.parse(b.published_at) - Date.parse(a.published_at))) {
               if (release.draft) continue;
               const sha = commits.get(release.tag_name);
-              if (sha) titles.set(sha, release.name || release.tag_name);
+              if (sha && !titles.has(sha)) titles.set(sha, release.name || release.tag_name);
             }
             function titleFor(sha, builtAt) {
               if (titles.has(sha)) return titles.get(sha) + ' Win[ZH]';
@@ -78,8 +93,8 @@ jobs:
               }).formatToParts(new Date(builtAt));
               const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
               const stamp = values.year + '-' + values.month + '-' + values.day
-                + '-' + values.hour + '：' + values.minute;
-              return 'Lichii nx2 (构建时间 ' + stamp + ') Win[ZH]';
+                + ' ' + values.hour + ':' + values.minute;
+              return 'Lichii nx2 Win[ZH](' + stamp + ')';
             }
             const upstreamTitle = titles.get(process.env.UPSTREAM_SHA);
             core.setOutput('title', upstreamTitle ? upstreamTitle + ' Win[ZH]' : '');
@@ -450,8 +465,8 @@ jobs:
           set -euo pipefail
           zip="Lichii-$RELEASE_TAG-windows-x64.zip"
           if [[ -z "$RELEASE_TITLE" ]]; then
-            stamp=$(TZ=Asia/Shanghai date '+%Y-%m-%d-%H：%M')
-            RELEASE_TITLE="Lichii nx2 (构建时间 $stamp) Win[ZH]"
+            stamp=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')
+            RELEASE_TITLE="Lichii nx2 Win[ZH]($stamp)"
           fi
           sha256sum --check SHA256SUMS.txt
           cat > notes.md <<EOF

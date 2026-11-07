@@ -1,0 +1,62 @@
+name: 检查上游新 Release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: lichii-upstream-release-check
+  cancel-in-progress: false
+
+jobs:
+  check-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: 新 Release 尚未有中文版时触发构建
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const upstream = { owner: 'zortos293', repo: 'Lichii' };
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              ...upstream, per_page: 100
+            });
+            const latest = releases
+              .filter(release => !release.draft && /^build-[0-9]+$/.test(release.tag_name))
+              .sort((a, b) => Date.parse(b.published_at) - Date.parse(a.published_at))[0];
+            if (!latest) {
+              core.info('No published upstream build release found.');
+              return;
+            }
+            const commit = await github.rest.repos.getCommit({
+              ...upstream, ref: latest.tag_name, per_page: 1
+            });
+            const tag = 'zh-cn-' + commit.data.sha.slice(0, 12) + '-u1';
+            try {
+              const existing = await github.rest.repos.getReleaseByTag({ ...context.repo, tag });
+              const name = (latest.name || latest.tag_name) + ' Win[ZH]';
+              if (!existing.data.draft && existing.data.name === name) {
+                core.info('Chinese package already published for ' + latest.tag_name);
+                return;
+              }
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            const runs = await github.rest.actions.listWorkflowRuns({
+              ...context.repo, workflow_id: 'build-zh-cn.yml', per_page: 100
+            });
+            if (runs.data.workflow_runs.some(run => run.status !== 'completed')) {
+              core.info('A Chinese build is active or queued. Check again next time.');
+              return;
+            }
+            await github.rest.actions.createWorkflowDispatch({
+              ...context.repo, workflow_id: 'build-zh-cn.yml',
+              ref: context.payload.repository.default_branch,
+              inputs: { upstream_tag: latest.tag_name }
+            });
+            core.info('Dispatched Chinese build for ' + latest.tag_name + ': ' + latest.name);
