@@ -78,9 +78,13 @@ jobs:
       - name: 设置 MSVC SDK
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: 安装上游指定的 LLVM
+      - name: 使用云构建机自带的 LLVM
         shell: pwsh
-        run: ./tools/windows/install-llvm.ps1
+        run: |
+          $llvm = 'C:/Program Files/LLVM'
+          & "$llvm/bin/clang-cl.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'clang-cl is unavailable' }
+          "LLVM_ROOT=$llvm" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: 安装 Qt
         uses: jurplel/install-qt-action@v4
