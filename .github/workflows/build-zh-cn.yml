@@ -75,6 +75,17 @@ jobs:
           ref: ${{ needs.check.outputs.sha }}
           persist-credentials: false
 
+      - name: 获取构建下载适配器
+        uses: actions/checkout@v5
+        with:
+          path: build-ci
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: 通过官方资产 API 下载构建依赖
+        shell: pwsh
+        run: python build-ci/.github/scripts/dependency_api.py . "$env:RUNNER_TEMP/lichii-dependency-api"
+
       - name: 设置 MSVC SDK
         uses: ilammy/msvc-dev-cmd@v1
 
@@ -221,6 +232,7 @@ jobs:
           for attempt in 1 2 3; do
             if cmake -S . -B build/release -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
+              "-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=$DEPENDENCY_API_INIT" \
               -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF \
               -DYUZU_CMD=ON -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF \
               -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_USE_BUNDLED_SDL3=ON \
