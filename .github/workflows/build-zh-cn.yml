@@ -4,11 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: 上游 build-N 标签，留空时优先构建新 Release，否则检查 nx2 最新提交
+        description: 上游已发布的 build-N Release 标签，留空时检查最新 Release
         type: string
         default: ''
-  schedule:
-    - cron: '23 */12 * * *'
 
 permissions:
   contents: read
@@ -38,38 +36,32 @@ jobs:
           upstream=https://github.com/zortos293/Lichii.git
           published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --jq '.[] | select(.draft == false) | .tag_name')
-          if [[ -n "$UPSTREAM_TAG" ]]; then
-            [[ "$UPSTREAM_TAG" =~ ^build-[0-9]+$ ]]
-          else
-            latest_tag=$(gh api --paginate --slurp 'repos/zortos293/Lichii/releases?per_page=100' \
+          if [[ -z "$UPSTREAM_TAG" ]]; then
+            UPSTREAM_TAG=$(gh api --paginate --slurp 'repos/zortos293/Lichii/releases?per_page=100' \
               --jq '[.[][] | select(.draft == false and (.tag_name | test("^build-[0-9]+$")))] | max_by(.published_at) | .tag_name // empty')
-            if [[ -n "$latest_tag" ]]; then
-              refs=$(git ls-remote --exit-code "$upstream" "refs/tags/$latest_tag" "refs/tags/$latest_tag^{}")
-              release_sha=$(cut -f1 <<< "$refs" | tail -n1)
-              [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]]
-              release_tag="zh-cn-${release_sha:0:12}-u1"
-              if ! grep -Fxq -- "$release_tag" <<< "$published"; then
-                UPSTREAM_TAG="$latest_tag"
-              fi
-            fi
           fi
           if [[ -z "$UPSTREAM_TAG" ]]; then
-            sha=$(git ls-remote --exit-code "$upstream" refs/heads/nx2 | cut -f1)
-          else
-            refs=$(git ls-remote --exit-code "$upstream" "refs/tags/$UPSTREAM_TAG" "refs/tags/$UPSTREAM_TAG^{}")
-            sha=$(cut -f1 <<< "$refs" | tail -n1)
+            echo 'No published upstream Release. Skip build.'
+            echo 'needed=false' >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          [[ "$UPSTREAM_TAG" =~ ^build-[0-9]+$ ]]
+          gh api "repos/zortos293/Lichii/releases/tags/$UPSTREAM_TAG" \
+            --jq 'select(.draft == false and .published_at != null) | .tag_name' | grep -Fxq -- "$UPSTREAM_TAG"
+          refs=$(git ls-remote --exit-code "$upstream" "refs/tags/$UPSTREAM_TAG" "refs/tags/$UPSTREAM_TAG^{}")
+          sha=$(cut -f1 <<< "$refs" | tail -n1)
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           tag="zh-cn-${sha:0:12}-u1"
           needed=true
           if grep -Fxq -- "$tag" <<< "$published"; then
             needed=false
           fi
-          echo "Selected upstream: ${UPSTREAM_TAG:-nx2} ($sha), build required: $needed"
+          echo "Selected upstream: $UPSTREAM_TAG ($sha), build required: $needed"
           printf 'sha=%s\ntag=%s\nneeded=%s\n' "$sha" "$tag" "$needed" >> "$GITHUB_OUTPUT"
 
       - name: 使用上游 Release 标题并更新已有中文版名称
         id: names
+        if: steps.source.outputs.sha != ''
         uses: actions/github-script@v8
         env:
           UPSTREAM_SHA: ${{ steps.source.outputs.sha }}
@@ -397,6 +389,30 @@ jobs:
           tests.write_text(text, encoding="utf-8")
           PY
 
+      - name: 修正上游 MSVC 局部变量遮蔽错误
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          path = Path("src/video_core/engines/kepler_compute.cpp")
+          text = path.read_text(encoding="utf-8")
+          start = text.find("bool KeplerCompute::BypassOotNetwork(")
+          if start >= 0:
+              end = text.find("\n}\n", start)
+              if end < 0:
+                  raise RuntimeError("Cannot locate end of BypassOotNetwork")
+              body = text[start:end]
+              if "auto* const state = rasterizer->OotNetworkBypass();" in body:
+                  body = re.sub(r"\bstate\b", "bypass_state", body)
+                  path.write_text(text[:start] + body + text[end:], encoding="utf-8")
+                  print("Renamed local bypass state to avoid MSVC C4458")
+              else:
+                  print("Upstream already avoids the local state shadow")
+          else:
+              print("Upstream does not contain BypassOotNetwork")
+          PY
+
       - name: 配置 Release 构建
         shell: bash
         run: >-
@@ -502,3 +518,4 @@ jobs:
               --target "$GITHUB_SHA" --title "$RELEASE_TITLE" \
               --notes-file notes.md
           fi
+

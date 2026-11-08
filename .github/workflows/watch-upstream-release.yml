@@ -3,7 +3,7 @@ name: 检查上游新 Release
 on:
   workflow_dispatch:
   schedule:
-    - cron: '7,22,37,52 * * * *'
+    - cron: '17 */6 * * *'
 
 permissions:
   contents: read
@@ -60,3 +60,4 @@ jobs:
               inputs: { upstream_tag: latest.tag_name }
             });
             core.info('Dispatched Chinese build for ' + latest.tag_name + ': ' + latest.name);
+
