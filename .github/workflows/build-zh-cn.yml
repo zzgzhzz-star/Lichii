@@ -2,11 +2,8 @@ name: Lichii 简体中文 Windows 构建
 
 on:
   workflow_dispatch:
-    inputs:
-      upstream_tag:
-        description: 上游已发布的 build-N Release 标签，留空时检查最新 Release
-        type: string
-        default: ''
+  schedule:
+    - cron: '17 */3 * * *'
 
 permissions:
   contents: read
@@ -16,118 +13,76 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  select-source:
-    permissions:
-      contents: write
+  check:
     runs-on: ubuntu-24.04
     outputs:
-      sha: ${{ steps.source.outputs.sha }}
-      tag: ${{ steps.source.outputs.tag }}
-      needed: ${{ steps.source.outputs.needed }}
-      title: ${{ steps.names.outputs.title }}
+      needed: ${{ steps.release.outputs.needed }}
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+      title: ${{ steps.release.outputs.title }}
     steps:
-      - name: 解析上游版本并跳过已发布提交
-        id: source
-        env:
-          GH_TOKEN: ${{ github.token }}
-          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
-        run: |
-          set -euo pipefail
-          upstream=https://github.com/zortos293/Lichii.git
-          published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select(.draft == false) | .tag_name')
-          if [[ -z "$UPSTREAM_TAG" ]]; then
-            UPSTREAM_TAG=$(gh api --paginate --slurp 'repos/zortos293/Lichii/releases?per_page=100' \
-              --jq '[.[][] | select(.draft == false and (.tag_name | test("^build-[0-9]+$")))] | max_by(.published_at) | .tag_name // empty')
-          fi
-          if [[ -z "$UPSTREAM_TAG" ]]; then
-            echo 'No published upstream Release. Skip build.'
-            echo 'needed=false' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          [[ "$UPSTREAM_TAG" =~ ^build-[0-9]+$ ]]
-          gh api "repos/zortos293/Lichii/releases/tags/$UPSTREAM_TAG" \
-            --jq 'select(.draft == false and .published_at != null) | .tag_name' | grep -Fxq -- "$UPSTREAM_TAG"
-          refs=$(git ls-remote --exit-code "$upstream" "refs/tags/$UPSTREAM_TAG" "refs/tags/$UPSTREAM_TAG^{}")
-          sha=$(cut -f1 <<< "$refs" | tail -n1)
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
-          tag="zh-cn-${sha:0:12}-u1"
-          needed=true
-          if grep -Fxq -- "$tag" <<< "$published"; then
-            needed=false
-          fi
-          echo "Selected upstream: $UPSTREAM_TAG ($sha), build required: $needed"
-          printf 'sha=%s\ntag=%s\nneeded=%s\n' "$sha" "$tag" "$needed" >> "$GITHUB_OUTPUT"
-
-      - name: 使用上游 Release 标题并更新已有中文版名称
-        id: names
-        if: steps.source.outputs.sha != ''
+      - name: 检查最新上游 Release
+        id: release
         uses: actions/github-script@v8
-        env:
-          UPSTREAM_SHA: ${{ steps.source.outputs.sha }}
         with:
           script: |
-            const upstream = { owner: 'zortos293', repo: 'Lichii', per_page: 100 };
-            const releases = await github.paginate(github.rest.repos.listReleases, upstream);
-            const tags = await github.paginate(github.rest.repos.listTags, upstream);
-            const commits = new Map(tags.map(tag => [tag.name, tag.commit.sha]));
-            const titles = new Map();
-            for (const release of [...releases].sort((a, b) => Date.parse(b.published_at) - Date.parse(a.published_at))) {
-              if (release.draft) continue;
-              const sha = commits.get(release.tag_name);
-              if (sha && !titles.has(sha)) titles.set(sha, release.name || release.tag_name);
-            }
-            function titleFor(sha, builtAt) {
-              if (titles.has(sha)) return titles.get(sha) + ' Win[ZH]';
-              const parts = new Intl.DateTimeFormat('en-GB', {
-                timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit',
-                day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
-              }).formatToParts(new Date(builtAt));
-              const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
-              const stamp = values.year + '-' + values.month + '-' + values.day
-                + ' ' + values.hour + ':' + values.minute;
-              return 'Lichii nx2 Win[ZH](' + stamp + ')';
-            }
-            const upstreamTitle = titles.get(process.env.UPSTREAM_SHA);
-            core.setOutput('title', upstreamTitle ? upstreamTitle + ' Win[ZH]' : '');
-            const chinese = await github.paginate(github.rest.repos.listReleases, {
-              ...context.repo, per_page: 100
+            const upstream = { owner: 'zortos293', repo: 'Lichii' };
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              ...upstream, per_page: 100
             });
-            for (const release of chinese) {
-              const match = /^zh-cn-([0-9a-f]{12})(?:-u1)?$/.exec(release.tag_name);
-              if (!match || release.draft) continue;
-              const source = /github\.com\/zortos293\/Lichii\/tree\/([0-9a-f]{40})/.exec(release.body || '');
-              const sha = [...titles.keys()].find(value => value.startsWith(match[1]))
-                || (source && source[1].startsWith(match[1]) ? source[1] : null);
-              if (!sha) continue;
-              const zip = release.assets.find(asset => asset.name.endsWith('.zip'));
-              const builtAt = zip?.created_at || release.published_at || release.created_at;
-              const name = titleFor(sha, builtAt);
-              if (release.name !== name) {
-                await github.rest.repos.updateRelease({
-                  ...context.repo, release_id: release.id, name
-                });
-                core.info('Updated ' + release.tag_name + ' to ' + name);
+            const latest = releases.filter(r => !r.draft && /^build-\d+$/.test(r.tag_name))
+              .sort((a, b) => Date.parse(b.published_at) - Date.parse(a.published_at))[0];
+            core.setOutput('needed', 'false');
+            if (!latest) return;
+            try {
+              const { data: existing } = await github.rest.repos.getReleaseByTag({
+                ...context.repo, tag: latest.tag_name
+              });
+              if (!existing.draft && existing.assets.some(a =>
+                a.name === 'lichii-windows-x86_64.zip' && a.state === 'uploaded')) {
+                core.info(latest.tag_name + ' 已发布中文版，跳过。');
+                return;
               }
+            } catch (error) {
+              if (error.status !== 404) throw error;
             }
+            const { data: commit } = await github.rest.repos.getCommit({
+              ...upstream, ref: latest.tag_name
+            });
+            core.setOutput('tag', latest.tag_name);
+            core.setOutput('sha', commit.sha);
+            core.setOutput('title', (latest.name || latest.tag_name) + ' Win[ZH]');
+            core.setOutput('needed', 'true');
 
   windows:
-    needs: select-source
-    if: needs.select-source.outputs.needed == 'true'
+    needs: check
+    if: needs.check.outputs.needed == 'true'
     runs-on: windows-2022
     timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.check.outputs.tag }}
+      RELEASE_TITLE: ${{ needs.check.outputs.title }}
+      UPSTREAM_SHA: ${{ needs.check.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+      FORK_REPO: ${{ github.repository }}
     steps:
-      - name: 获取选定的上游源码
+      - name: 获取上游 Release 源码
         uses: actions/checkout@v5
         with:
           repository: zortos293/Lichii
-          ref: ${{ needs.select-source.outputs.sha }}
+          ref: ${{ needs.check.outputs.sha }}
           persist-credentials: false
 
-      - name: 设置 MSVC
+      - name: 设置 MSVC SDK
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: 安装 Qt 6
+      - name: 安装上游指定的 LLVM
+        shell: pwsh
+        run: ./tools/windows/install-llvm.ps1
+
+      - name: 安装 Qt
         uses: jurplel/install-qt-action@v4
         with:
           version: '6.8.3'
@@ -141,13 +96,13 @@ jobs:
         shell: pwsh
         run: ./tools/windows/install-vulkan-sdk.ps1
 
-      - name: 补齐简体中文词条
+      - name: 添加中文并修改更新仓库地址
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
           import xml.etree.ElementTree as ET
-
+          
           supplements = {
               "MainWindow": {
                   "Open &Lichii Folders": "打开 Lichii 文件夹(&L)",
@@ -213,7 +168,7 @@ jobs:
                   "Failed to update NUP metadata:\n%1": "无法更新 NUP 元数据：\n%1",
               },
           }
-
+          
           path = Path("dist/languages/zh_CN.ts")
           tree = ET.parse(path)
           root = tree.getroot()
@@ -223,7 +178,7 @@ jobs:
               if context is None:
                   context = ET.SubElement(root, "context")
                   ET.SubElement(context, "name").text = name
-
+          
               messages = {
                   message.findtext("source"): message
                   for message in context.findall("message")
@@ -241,281 +196,73 @@ jobs:
                       continue
                   translation.attrib.pop("type", None)
                   translation.text = text
-
+          
           ET.indent(tree)
           path.write_text('<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE TS>\n'
                           + ET.tostring(root, encoding="unicode") + "\n", encoding="utf-8")
-          PY
-
-      - name: 接入中文版程序内更新
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          
-          def replace_once(path, before, after):
-              text = path.read_text(encoding="utf-8")
-              if text.count(before) != 1:
-                  raise RuntimeError(f"Updater patch no longer matches upstream: {path}")
-              path.write_text(text.replace(before, after), encoding="utf-8")
-          
+          # Keep the upstream updater, build-N tags and asset names unchanged.
+          import os
           scm = Path("CMakeModules/GenerateSCMRev.cmake")
-          replace_once(scm, 'set(BUILD_AUTO_UPDATE_STABLE_REPO "zortos293/Lichii")',
-                       'set(BUILD_AUTO_UPDATE_STABLE_REPO "zzgzhzz-star/Lichii")')
-          replace_once(scm, 'set(BUILD_AUTO_UPDATE_API_PATH "/repos/zortos293/Lichii/releases?per_page=100")',
-                       'set(BUILD_AUTO_UPDATE_API_PATH "/repos/zzgzhzz-star/Lichii/releases?per_page=100")')
-          replace_once(scm, 'set(BUILD_AUTO_UPDATE_REPO "zortos293/Lichii")',
-                       'set(BUILD_AUTO_UPDATE_REPO "zzgzhzz-star/Lichii")')
-          replace_once(scm, 'if (LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")',
-                       'if (LICHII_BUILD_TAG MATCHES "^build-[0-9]+$" OR LICHII_BUILD_TAG MATCHES "^zh-cn-[0-9a-f]+-u1$")')
+          text = scm.read_text(encoding="utf-8")
+          upstream = "zortos293/Lichii"
+          if text.count(upstream) != 3:
+              raise RuntimeError("Upstream update configuration changed; review repository URLs")
+          scm.write_text(text.replace(upstream, os.environ["FORK_REPO"]), encoding="utf-8")
           
-          net = Path("src/common/net/net.cpp")
-          modern_net = 'platform.remove_suffix(4)' in net.read_text(encoding="utf-8")
-          if modern_net:
-              replace_once(net,
-                  '            const auto filename = fmt::format("lichii-{}{}{}", platform, variant, extension);',
-                  '''            const auto filename = platform == "windows-x86_64" && variant.empty() && tag.starts_with("zh-cn-")
-                                                ? fmt::format("Lichii-{}-windows-x64.zip", tag)
-                                                : fmt::format("lichii-{}{}{}", platform, variant, extension);''')
-          else:
-              replace_once(net,
-              '        const auto filename = fmt::format("lichii-{}{}", platform, extension);',
-              '''        const auto filename = platform == "windows-x86_64" && tag.starts_with("zh-cn-")
-                                            ? fmt::format("Lichii-{}-windows-x64.zip", tag)
-                                            : fmt::format("lichii-{}{}", platform, extension);''')
-          
-          checker = Path("src/frontend_common/update_checker.cpp")
-          modern_checker = 'CheckResult Check()' in checker.read_text(encoding="utf-8")
-          replace_once(checker, "#include <charconv>", "#include <algorithm>\n#include <charconv>")
-          replace_once(checker,
-              "    auto newest = ParseBuildNumber(build_tag);",
-              '''    if (build_tag.starts_with("zh-cn-")) {
-                  const auto current = std::find_if(releases.begin(), releases.end(),
-                                                   [build_tag](const auto& release) {
-                                                       return release.tag == build_tag;
-                                                   });
-                  if (current == releases.end()) {
-                      return std::nullopt;
-                  }
-                  const Common::Net::Release* selected = &*current;
-                  for (const auto& release : releases) {
-                      if (release.tag.starts_with("zh-cn-") &&
-                          release.published > selected->published &&
-                          !release.GetPlatformAssets(platform).empty()) {
-                          selected = &release;
-                      }
-                  }
-                  return selected == &*current ? std::nullopt : std::make_optional(*selected);
-              }
-          
-              auto newest = ParseBuildNumber(build_tag);''')
-          replace_once(checker,
-              '''    if (!ParseBuildNumber(Common::g_build_release_tag) ||
-                  std::string_view{Common::g_build_release_platform}.empty()) {''',
-              '''    const std::string_view build_tag{Common::g_build_release_tag};
-              if ((!build_tag.starts_with("zh-cn-") && !ParseBuildNumber(build_tag)) ||
-                  std::string_view{Common::g_build_release_platform}.empty()) {''')
-          before_select = '''    auto update = SelectUpdate(Common::Net::GetReleases(), Common::g_build_release_tag,
-                                         Common::g_build_release_platform);'''
-          if modern_checker:
-              before_select = '''    auto update = SelectUpdate(list.releases, Common::g_build_release_tag,
-                                         Common::g_build_release_platform,
-                                         Common::Net::CurrentLinuxPackage());'''
-          after_select = '''    auto releases = Common::Net::GetReleases();
-              if (build_tag.starts_with("zh-cn-") &&
-                  std::none_of(releases.begin(), releases.end(), [build_tag](const auto& release) {
-                      return release.tag == build_tag;
-                  })) {
-                  const auto path = std::string{"/repos/"} + Common::g_build_auto_update_repo +
-                                    "/releases/tags/" + std::string{build_tag};
-                  const auto body = Common::Net::MakeRequest(
-                      std::string{"https://"} + Common::g_build_auto_update_stable_api, path);
-                  if (body) {
-                      const auto current = Common::Net::Release::FromJson(
-                          std::string_view{*body}, Common::g_build_auto_update_stable_api,
-                          Common::g_build_auto_update_repo);
-                      if (current) {
-                          releases.push_back(*current);
-                      }
-                  }
-              }
-              auto update = SelectUpdate(releases, build_tag, Common::g_build_release_platform);'''
-          if modern_checker:
-              after_select = after_select.replace('auto releases = Common::Net::GetReleases();',
-                                                  'auto releases = list.releases;')
-          replace_once(checker, before_select, after_select)
-          
-          tests = Path("src/tests/common/update_checker.cpp")
-          text = tests.read_text(encoding="utf-8").replace("zortos293/Lichii", "zzgzhzz-star/Lichii")
-          text += r'''
-          TEST_CASE("Chinese updates use release publication order and matching ZIP files", "[updater][zh-cn-updater]") {
-              auto current = MakeRelease("zh-cn-aaaaaaaaaaaa-u1",
-                                         "Lichii-zh-cn-aaaaaaaaaaaa-u1-windows-x64.zip");
-              current.published = 100;
-              auto newer = MakeRelease("zh-cn-bbbbbbbbbbbb-u1",
-                                       "Lichii-zh-cn-bbbbbbbbbbbb-u1-windows-x64.zip");
-              newer.published = 200;
-              auto older = MakeRelease("zh-cn-cccccccccccc",
-                                       "Lichii-zh-cn-cccccccccccc-windows-x64.zip");
-              older.published = 50;
-              auto wrong_platform = MakeRelease("zh-cn-dddddddddddd-u1", "lichii-linux-x86_64.tar.gz");
-              wrong_platform.published = 300;
-              auto foreign = MakeRelease("zh-cn-eeeeeeeeeeee-u1",
-                                         "Lichii-zh-cn-eeeeeeeeeeee-u1-windows-x64.zip");
-              foreign.published = 400;
-              foreign.assets = {"https://github.com/zortos293/Lichii/releases/download/" +
-                                foreign.tag + "/Lichii-" + foreign.tag + "-windows-x64.zip"};
-              const auto releases = std::array{wrong_platform, older, foreign, newer, current};
-              const auto update = UpdateChecker::SelectUpdate(releases, current.tag, "windows-x86_64");
-              REQUIRE(update);
-              CHECK(update->tag == newer.tag);
-              const auto assets = update->GetPlatformAssets("windows-x86_64");
-              REQUIRE(assets.size() == 1);
-              CHECK(assets[0].filename == "Lichii-zh-cn-bbbbbbbbbbbb-u1-windows-x64.zip");
-              CHECK(assets[0].path == "/zzgzhzz-star/Lichii/releases/download/" + newer.tag +
-                                     "/" + assets[0].filename);
-              CHECK_FALSE(UpdateChecker::SelectUpdate(releases, newer.tag, "windows-x86_64"));
-              CHECK_FALSE(UpdateChecker::SelectUpdate(releases, current.tag, "android-arm64"));
-              CHECK_FALSE(UpdateChecker::SelectUpdate(releases, "zh-cn-missing-u1", "windows-x86_64"));
-              CHECK_FALSE(UpdateChecker::SelectUpdate({}, current.tag, "windows-x86_64"));
-              auto renamed = releases;
-              renamed[3].title = "Lichii nx2 build 93 (bbbbbbb) Win[ZH]";
-              CHECK(UpdateChecker::SelectUpdate(renamed, current.tag, "windows-x86_64")->tag == newer.tag);
-              auto same_time = std::array{current, newer};
-              same_time[1].published = current.published;
-              CHECK_FALSE(UpdateChecker::SelectUpdate(same_time, current.tag, "windows-x86_64"));
-          }
-          '''
-          tests.write_text(text, encoding="utf-8")
           PY
 
-      - name: 修正上游 MSVC 局部变量遮蔽错误
+      - name: 按上游 Windows 方式配置
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          import re
-          path = Path("src/video_core/engines/kepler_compute.cpp")
-          text = path.read_text(encoding="utf-8")
-          start = text.find("bool KeplerCompute::BypassOotNetwork(")
-          if start >= 0:
-              end = text.find("\n}\n", start)
-              if end < 0:
-                  raise RuntimeError("Cannot locate end of BypassOotNetwork")
-              body = text[start:end]
-              if "auto* const state = rasterizer->OotNetworkBypass();" in body:
-                  body = re.sub(r"\bstate\b", "bypass_state", body)
-                  path.write_text(text[:start] + body + text[end:], encoding="utf-8")
-                  print("Renamed local bypass state to avoid MSVC C4458")
-              else:
-                  print("Upstream already avoids the local state shadow")
-          else:
-              print("Upstream does not contain BypassOotNetwork")
-          PY
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DENABLE_QT_TRANSLATION=ON -DENABLE_UPDATE_CHECKER=ON \
+            "-DLICHII_BUILD_TAG=$RELEASE_TAG" \
+            -DLICHII_BUILD_PLATFORM=windows-x86_64 \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
+            "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
+            "-DCMAKE_C_FLAGS=-DWIN32 -D_WINDOWS -DNOMINMAX -flto=thin" \
+            "-DCMAKE_CXX_FLAGS=-EHsc -DWIN32 -D_WINDOWS -DNOMINMAX -flto=thin"
 
-      - name: 配置 Release 构建
-        shell: bash
-        run: >-
-          cmake -S . -B build/release -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          -DBUILD_TESTING=ON
-          -DYUZU_TESTS=ON
-          -DYUZU_CMD=OFF
-          -DYUZU_ROOM=OFF
-          -DYUZU_ROOM_STANDALONE=OFF
-          -DYUZU_USE_BUNDLED_QT=OFF
-          -DYUZU_USE_BUNDLED_SDL3=ON
-          -DENABLE_QT_TRANSLATION=ON
-          -DENABLE_UPDATE_CHECKER=ON
-          -DLICHII_BUILD_TAG=${{ needs.select-source.outputs.tag }}
-          -DLICHII_BUILD_PLATFORM=windows-x86_64
-          -DUSE_DISCORD_PRESENCE=OFF
-
-      - name: 编译并测试更新器
-        run: cmake --build build/release --target update_checker_tests --parallel
-
-      - name: 运行更新器回归测试
-        shell: pwsh
-        run: |
-          $env:PATH = "$env:QT_ROOT_DIR/bin;$env:PATH"
-          & build/release/bin/update_checker_tests.exe
-          if ($LASTEXITCODE -ne 0) { throw 'Updater tests failed' }
-
-      - name: 编译 Lichii
-        run: cmake --build build/release --target yuzu --parallel
+      - name: 编译
+        run: cmake --build build/release --target yuzu yuzu-cmd lichii-updater --parallel
 
       - name: 验证并打包
         shell: pwsh
-        env:
-          RELEASE_TAG: ${{ needs.select-source.outputs.tag }}
         run: |
-          $bin = 'build/release/bin'
-          $exe = Join-Path $bin 'lichii.exe'
-          if (-not (Test-Path $exe)) { throw 'lichii.exe is missing' }
+          foreach ($exe in 'lichii.exe', 'eden-cli.exe', 'lichii-updater.exe') {
+            if (-not (Test-Path "build/release/bin/$exe")) { throw "$exe is missing" }
+          }
           if (-not (Test-Path 'build/release/src/yuzu/zh_CN.qm')) { throw 'zh_CN.qm is missing' }
-          Remove-Item -LiteralPath (Join-Path $bin 'update_checker_tests.exe')
-          $testSymbols = Join-Path $bin 'update_checker_tests.pdb'
-          if (Test-Path $testSymbols) { Remove-Item -LiteralPath $testSymbols }
-          windeployqt --release --no-translations $exe
+          windeployqt --release --no-translations build/release/bin/lichii.exe
           if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed' }
-          Copy-Item -LiteralPath 'LICENSE.txt' -Destination $bin
-          Copy-Item -LiteralPath 'LICENSES' -Destination $bin -Recurse -Force
-          @(
-            '打开 lichii.exe，选择 Emulation > Configure > General > UI。'
-            '在 Interface language 中选择 Chinese (China)。'
-          ) | Set-Content -Encoding utf8 (Join-Path $bin '简体中文说明.txt')
-          $zip = "Lichii-$env:RELEASE_TAG-windows-x64.zip"
-          Compress-Archive -Path "$bin/*" -DestinationPath $zip
-          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
-          "$hash  $zip`n" | Set-Content -Encoding ascii -NoNewline SHA256SUMS.txt
+          Compress-Archive -Path build/release/bin/* -DestinationPath lichii-windows-x86_64.zip
+          $hash = (Get-FileHash lichii-windows-x86_64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  lichii-windows-x86_64.zip" | Set-Content SHA256SUMS.txt -Encoding utf8
 
-      - uses: actions/upload-artifact@v7
-        with:
-          name: lichii-zh-cn
-          path: |
-            Lichii-*-windows-x64.zip
-            SHA256SUMS.txt
-          if-no-files-found: error
-
-  publish:
-    needs: [select-source, windows]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: lichii-zh-cn
-
-      - name: 发布中文 Windows ZIP
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.select-source.outputs.tag }}
-          UPSTREAM_SHA: ${{ needs.select-source.outputs.sha }}
-          RELEASE_TITLE: ${{ needs.select-source.outputs.title }}
+      - name: 发布中文版 Release
+        shell: pwsh
         run: |
-          set -euo pipefail
-          zip="Lichii-$RELEASE_TAG-windows-x64.zip"
-          if [[ -z "$RELEASE_TITLE" ]]; then
-            stamp=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')
-            RELEASE_TITLE="Lichii nx2 Win[ZH]($stamp)"
-          fi
-          sha256sum --check SHA256SUMS.txt
-          cat > notes.md <<EOF
-          Lichii Windows x64 简体中文构建。解压 ZIP，打开 lichii.exe。
-          在 Emulation → Configure → General → UI → Interface language 选择 Chinese (China)。
-
-          - 上游源码：https://github.com/zortos293/Lichii/tree/$UPSTREAM_SHA
-          - 中文词条及构建配置：https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/.github/workflows/build-zh-cn.yml
-          EOF
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' > draft.txt 2>/dev/null; then
-            if grep -Fxq true draft.txt; then
-              gh release upload "$RELEASE_TAG" "$zip" SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
-              gh release edit "$RELEASE_TAG" --draft=false --title "$RELEASE_TITLE" --repo "$GITHUB_REPOSITORY"
-            fi
-          else
-            gh release create "$RELEASE_TAG" "$zip" SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" --title "$RELEASE_TITLE" \
-              --notes-file notes.md
-          fi
+          $ErrorActionPreference = 'Stop'
+          @"
+          Windows x64 简体中文版。解压后运行 lichii.exe。
+          上游 Release：https://github.com/zortos293/Lichii/releases/tag/$env:RELEASE_TAG
+          上游源码：https://github.com/zortos293/Lichii/tree/$env:UPSTREAM_SHA
+          程序更新检查指向 https://github.com/$env:FORK_REPO 。
+          "@ | Set-Content release-notes.txt -Encoding utf8
+          gh release view $env:RELEASE_TAG --repo $env:FORK_REPO *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:RELEASE_TAG --repo $env:FORK_REPO --target '${{ github.sha }}' --draft --title $env:RELEASE_TITLE --notes-file release-notes.txt
+            if ($LASTEXITCODE -ne 0) { throw 'Create release failed' }
+          }
+          gh release upload $env:RELEASE_TAG lichii-windows-x86_64.zip SHA256SUMS.txt --repo $env:FORK_REPO --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Upload assets failed' }
+          gh release edit $env:RELEASE_TAG --repo $env:FORK_REPO --title $env:RELEASE_TITLE --notes-file release-notes.txt --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Publish release failed' }
 
